@@ -1,0 +1,401 @@
+const express = require('express');
+const mysql = require('mysql');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+
+// ✅ Load Environment Variables
+const jwtSecret = process.env.JWT_SECRET || "fallback_default_secret";
+
+// ✅ Initialize Express App
+const app = express();
+app.use(cors());
+app.use(express.json()); // Middleware to parse JSON
+
+// ✅ Database Connection
+const db = mysql.createConnection({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME
+});
+
+db.connect(err => {
+    if (err) {
+        console.error("❌ Database connection failed:", err);
+        return;
+    }
+    console.log("✅ Connected to MySQL Database!");
+});
+
+// ✅ Middleware: Authenticate User Token
+const authenticateToken = (req, res, next) => {
+    const token = req.header('Authorization')?.split(' ')[1];
+
+    if (!token) return res.status(401).json({ error: "Access denied. No token provided." });
+
+    jwt.verify(token, jwtSecret, (err, user) => {
+        if (err) {
+            console.error("JWT Verification Error:", err);
+            return res.status(403).json({ error: "Invalid or expired token. Please log in again." });
+        }
+        req.user = user;
+        next();
+    });
+};
+
+// ✅ Register a New User
+app.post('/register', async (req, res) => {
+    const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+        return res.status(400).json({ error: "All fields are required." });
+    }
+
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        db.query("INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)", 
+            [name, email, hashedPassword], (err, result) => {
+                if (err) {
+                    if (err.code === 'ER_DUP_ENTRY') {
+                        return res.status(400).json({ error: "Email already registered. Try logging in!" });
+                    }
+                    console.error("Database Insertion Error:", err);
+                    return res.status(500).json({ error: "Database error. Please try again later." });
+                }
+                res.status(201).json({ message: "🙌 User registered successfully!" });
+            });
+    } catch (error) {
+        res.status(500).json({ error: "Internal Server Error." });
+    }
+});
+// ✅ User Login
+app.post('/login', (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+        return res.status(400).json({ error: "Email and password are required." });
+    }
+
+    db.query("SELECT * FROM users WHERE email = ?", [email], async (err, results) => {
+        if (err) return res.status(500).json({ error: "Database error." });
+
+        if (results.length === 0) {
+            return res.status(401).json({ error: "Invalid email or password." });
+        }
+
+        const user = results[0];
+        const passwordMatch = await bcrypt.compare(password, user.password_hash);
+        if (!passwordMatch) {
+            return res.status(401).json({ error: "Invalid email or password." });
+        }
+
+        const token = jwt.sign({ user_id: user.user_id, email: user.email }, jwtSecret, { expiresIn: "7d" });
+
+        res.json({ message: "✅ Login successful!", token });
+    });
+});
+
+// ✅ Get All Users (Protected)
+app.get('/users', authenticateToken, (req, res) => {
+    db.query("SELECT user_id, name, email FROM users", (err, results) => {
+        if (err) return res.status(500).json({ error: "Database error." });
+        res.json(results);
+    });
+});
+
+// ✅ Create a New Home (Protected)
+app.post('/homes', authenticateToken, (req, res) => {
+    const { home_name } = req.body;
+    
+    if (!home_name) {
+        return res.status(400).json({ error: "Home name is required." });
+    }
+
+    db.query("SELECT home_id FROM homes WHERE home_name = ?", [home_name], (err, results) => {
+        if (err) return res.status(500).json({ error: "Database error while checking existing homes." });
+
+        if (results.length > 0) {
+            return res.status(400).json({ error: "A home with this name already exists. Choose a different name." });
+        }
+
+        db.query("INSERT INTO homes (home_name, admin_id) VALUES (?, ?)", 
+            [home_name, req.user.user_id], (err, result) => {
+                if (err) {
+                    console.error("Database error:", err);
+                    return res.status(500).json({ error: "Database error while creating the home." });
+                }
+                res.status(201).json({ message: "🏠 Home created successfully!", home_id: result.insertId });
+            }
+        );
+    });
+});
+
+// ✅ Get Homes for the Logged-in User
+app.get('/homes', authenticateToken, (req, res) => {
+    db.query("SELECT * FROM homes WHERE admin_id = ?", [req.user.user_id], (err, results) => {
+        if (err) return res.status(500).json({ error: "Database error." });
+        res.json(results);
+    });
+});
+// ✅ Get a Specific Home by ID (Only If the User Has Access)
+app.get('/homes/:home_id', authenticateToken, (req, res) => {
+    const home_id = req.params.home_id;
+    const user_id = req.user.user_id; // Logged-in user
+
+    db.query(
+        "SELECT * FROM homes WHERE home_id = ? AND admin_id = ?",
+        [home_id, user_id],
+        (err, results) => {
+            if (err) {
+                console.error("Database error:", err);
+                return res.status(500).json({ error: "Database error." });
+            }
+
+            if (results.length === 0) {
+                return res.status(404).json({ error: "Home not found or access denied." });
+            }
+
+            res.json(results[0]); // Return only the first matching home
+        }
+    );
+});
+
+
+// ✅ Create a New Task (Protected)
+app.post('/tasks', authenticateToken, (req, res) => {
+    const { home_id, task_name, description, difficulty_level, repeat_interval, task_type } = req.body;
+
+    if (!home_id || !task_name || !difficulty_level || !repeat_interval || !task_type) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    // ✅ Assign points based on difficulty level
+    let points = 10; // Default value
+    if (difficulty_level === "Easy") points = 5;
+    else if (difficulty_level === "Hard") points = 20;
+
+    // ✅ Check if home exists
+    db.query("SELECT home_id FROM homes WHERE home_id = ?", [home_id], (err, homeResults) => {
+        if (err) {
+            console.error("Database error:", err);
+            return res.status(500).json({ error: "Database error while checking home." });
+        }
+
+        if (homeResults.length === 0) {
+            return res.status(400).json({ error: "Invalid home_id. Please create a home first." });
+        }
+
+        // ✅ Check if a task with the same name already exists in this home
+        db.query("SELECT task_id FROM tasks WHERE home_id = ? AND task_name = ?", [home_id, task_name], (err, taskResults) => {
+            if (err) {
+                console.error("Database error:", err);
+                return res.status(500).json({ error: "Database error while checking existing tasks." });
+            }
+
+            if (taskResults.length > 0) {
+                return res.status(400).json({ error: "A task with this name already exists in this home. Choose a different name." });
+            }
+
+            // ✅ Insert new task into the database
+            db.query(
+                "INSERT INTO tasks (home_id, task_name, description, difficulty_level, repeat_interval, task_type, points) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [home_id, task_name, description || '', difficulty_level, repeat_interval, task_type, points],
+                (err, result) => {
+                    if (err) {
+                        console.error("Database error:", err);
+                        return res.status(500).json({ error: "Internal server error while creating the task." });
+                    }
+                    res.status(201).json({
+                        message: "✅ Task created successfully!",
+                        task_id: result.insertId,
+                        points: points
+                    });
+                }
+            );
+        });
+    });
+});
+
+
+// ✅ Get All Tasks (Protected)
+app.get('/tasks', authenticateToken, (req, res) => {
+    db.query("SELECT * FROM tasks", (err, results) => {
+        if (err) return res.status(500).json({ error: "Database error." });
+        res.json(results);
+    });
+});
+
+// ✅ Assign Task to a User
+app.post('/assign-task', authenticateToken, (req, res) => {
+    const { task_id, assigned_user_id } = req.body;
+
+    if (!task_id || !assigned_user_id) {
+        return res.status(400).json({ error: "Task ID and Assigned User ID are required." });
+    }
+
+    db.query("SELECT * FROM tasks WHERE task_id = ?", [task_id], (err, taskResults) => {
+        if (err) return res.status(500).json({ error: "Database error." });
+        if (taskResults.length === 0) return res.status(404).json({ error: "Task not found." });
+
+        db.query(
+            "INSERT INTO task_assignments (task_id, assigned_user_id, assigned_by) VALUES (?, ?, ?)",
+            [task_id, assigned_user_id, req.user.user_id],
+            (err, result) => {
+                if (err) {
+                    console.error("Database error:", err);
+                    return res.status(500).json({ error: "Database error while assigning task." });
+                }
+                res.status(201).json({ message: "📌 Task assigned successfully!" });
+            }
+        );
+    });
+});
+
+// ✅ Mark Task as Complete (Protected)
+app.put('/tasks/complete', authenticateToken, (req, res) => {
+    const { assignment_id } = req.body;
+
+    if (!assignment_id) {
+        return res.status(400).json({ error: "Assignment ID is required." });
+    }
+
+    // ✅ Fetch Task Details, Assigned User, and Points
+    db.query(
+        `SELECT t.points, ta.assigned_user_id, t.home_id, ta.status
+         FROM task_assignments ta
+         JOIN tasks t ON ta.task_id = t.task_id
+         WHERE ta.assignment_id = ?`,
+        [assignment_id],
+        (err, results) => {
+            if (err) {
+                console.error("Database error while fetching task:", err);
+                return res.status(500).json({ error: "Database error." });
+            }
+
+            if (results.length === 0) {
+                return res.status(404).json({ error: "Task not found." });
+            }
+
+            const { assigned_user_id, home_id, points, status } = results[0];
+
+            // ✅ Prevent Re-Completion of Tasks
+            if (status === 'completed') {
+                return res.status(400).json({ error: "Task is already marked as completed." });
+            }
+
+            // ✅ Update task status to 'completed'
+            db.query(
+                "UPDATE task_assignments SET status = 'completed' WHERE assignment_id = ?",
+                [assignment_id],
+                (err, result) => {
+                    if (err) {
+                        console.error("Database error while updating task status:", err);
+                        return res.status(500).json({ error: "Error marking task as complete." });
+                    }
+
+                    // ✅ Update or Insert Leaderboard Points
+                    db.query(
+                        `INSERT INTO leaderboard (home_id, user_id, month, year, total_points) 
+                         VALUES (?, ?, MONTH(CURDATE()), YEAR(CURDATE()), ?) 
+                         ON DUPLICATE KEY UPDATE total_points = total_points + ?`,
+                        [home_id, assigned_user_id, points, points],
+                        (err, leaderboardResult) => {
+                            if (err) {
+                                console.error("Leaderboard update error:", err);
+                                return res.status(500).json({ error: "Error updating leaderboard." });
+                            }
+                            res.json({
+                                message: `✅ Task completed! ${points} points awarded.`,
+                                points_awarded: points
+                            });
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
+
+// ✅ Get Leaderboard for a Home
+app.get('/leaderboard/:home_id', authenticateToken, (req, res) => {
+    const home_id = req.params.home_id;
+
+    if (!home_id) {
+        return res.status(400).json({ error: "Home ID is required." });
+    }
+
+    db.query(
+        `SELECT u.user_id, u.name, u.avatar_id, l.total_points
+         FROM leaderboard l
+         JOIN users u ON l.user_id = u.user_id
+         WHERE l.home_id = ?
+         ORDER BY l.total_points DESC`,
+        [home_id],
+        (err, results) => {
+            if (err) {
+                console.error("Database error:", err);
+                return res.status(500).json({ error: "Database error while fetching leaderboard." });
+            }
+
+            if (results.length === 0) {
+                return res.status(404).json({ message: "No leaderboard data found for this home." });
+            }
+
+            res.json(results);
+        }
+    );
+});
+
+
+app.get('/lowest-scorers/:home_id', authenticateToken, (req, res) => {
+    const home_id = req.params.home_id;
+
+    if (!home_id) {
+        return res.status(400).json({ error: "Home ID is required." });
+    }
+
+    db.query(
+        `SELECT u.user_id, u.name, u.avatar_id, l.total_points
+         FROM leaderboard l
+         JOIN users u ON l.user_id = u.user_id
+         WHERE l.home_id = ?
+         ORDER BY l.total_points ASC LIMIT 5`,  // ✅ Sorting by lowest points first
+        [home_id],
+        (err, results) => {
+            if (err) {
+                console.error("Database error:", err);
+                return res.status(500).json({ error: "Database error while fetching lowest scorers." });
+            }
+
+            if (results.length === 0) {
+                return res.status(404).json({ message: "No leaderboard data found for this home." });
+            }
+
+            res.json(results);
+        }
+    );
+});
+
+
+// ✅ Notifications
+app.get('/notifications', authenticateToken, (req, res) => {
+    db.query("SELECT * FROM notifications WHERE user_id = ?", [req.user.user_id], (err, results) => {
+        if (err) return res.status(500).json({ error: "Database error." });
+        res.json(results);
+    });
+});
+
+// ✅ Test API Route
+app.get("/", (req, res) => {
+    res.send("Chorely Backend is Running!");
+});
+
+// ✅ Start the Server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`🚀 Server is running on port ${PORT}`);
+});
