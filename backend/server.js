@@ -50,6 +50,14 @@ app.get("/", (req, res) => {
     res.send("Chorely Backend is Running! 🚀");
 });
 
+// ✅ Serve React Frontend Static Files
+app.use(express.static(path.join(__dirname, '../frontend/build')));
+
+// ✅ Handle React Routing - catch all other routes
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
+});
+
 // ✅ Error handling middleware
 app.use((err, req, res, next) => {
     console.error("Unhandled error:", err);
