@@ -4,7 +4,7 @@ import { getToken, clearUserData } from '../utils/auth';
 
 // Create axios instance with base URL
 const API = axios.create({
-  baseURL: process.env.REACT_APP_API_URL || 'http://localhost:5000',
+  baseURL: process.env.REACT_APP_API_URL || '',
   headers: {
     'Content-Type': 'application/json',
   },
@@ -146,7 +146,7 @@ export const uploadService = {
     };
     return API.post('/uploads/task-images', formData, config);
   },
-  getImageUrl: (filename) => `${process.env.REACT_APP_API_URL || 'http://localhost:5000'}/uploads/images/${filename}`,
+  getImageUrl: (filename) => `${process.env.REACT_APP_API_URL || ''}/uploads/images/${filename}`,
 };
 
 export default API;
